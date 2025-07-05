@@ -1,0 +1,12 @@
+/images
+/NaiLong.v5i.yolov8-obb
+/NailongKiller.v1i.yolov8-obb
+/NailongKiller.v1i.yolov8-obb(positive-only)
+/negative_image
+/rebbox
+/runs
+/yolo_dataset
+/yolo_dataset(positive-only)
+/yolo11n.pt
+/yolov8n.pt
+/yolov8n-cls.pt
