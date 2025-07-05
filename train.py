@@ -3,6 +3,7 @@ import torch
 
 if __name__ == "__main__":
 
+    """
     # 加载预训练的YOLOv8n检测模型
     model = YOLO("yolov8n.pt")  # 使用检测模型
 
@@ -23,8 +24,8 @@ if __name__ == "__main__":
 
     # 评估模型
     metrics = model.val()
-
-    # model = YOLO("runs/detect/whole_image_detection/weights/best.pt")
+    """
+    model = YOLO("runs/detect/whole_image_detection/weights/best.pt")
     # 导出模型
-    path = model.export(format="onnx", opset=15)
+    path = model.export(format="onnx", opset=15, dynamic=True)
     print(f"模型已导出至: {path}")

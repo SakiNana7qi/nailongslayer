@@ -65,6 +65,8 @@ def get_inference_results(
     """
     对单张图像(如屏幕截图)执行完整的切片推理，并返回检测结果列表。
     """
+    t_total_start = time.perf_counter()
+
     input_name = session.get_inputs()[0].name
     output_names = [output.name for output in session.get_outputs()]
 
@@ -73,42 +75,89 @@ def get_inference_results(
     overlap_ratio = 0.2
     stride = int(tile_size * (1 - overlap_ratio))
 
-    all_detections = []
+    # 批量处理
 
+    t_tile_prep_start = time.perf_counter()
+    tiles_with_coords = []
     y_steps = np.arange(0, orig_h, stride)
     x_steps = np.arange(0, orig_w, stride)
 
     for y in y_steps:
         for x in x_steps:
             tile = image[y : min(y + tile_size, orig_h), x : min(x + tile_size, orig_w)]
-            if tile.shape[0] == 0 or tile.shape[1] == 0:
-                continue
+            if tile.shape[0] > 0 and tile.shape[1] > 0:
+                tiles_with_coords.append({"tile": tile, "x": x, "y": y})
 
-            input_tensor, scale, pad_w, pad_h = preprocess_tile(tile, imgsz)
-            outputs = session.run(output_names, {input_name: input_tensor})
+    if not tiles_with_coords:
+        return []
 
-            dets = outputs[0].transpose(0, 2, 1)[0]
-            for det in dets:
-                cx, cy, w, h = det[:4]
-                max_score = np.max(det[4:])
-                if max_score > conf_threshold:
-                    class_id = np.argmax(det[4:])
-                    x1 = (cx - w / 2 - pad_w) / scale + x
-                    y1 = (cy - h / 2 - pad_h) / scale + y
-                    x2 = (cx + w / 2 - pad_w) / scale + x
-                    y2 = (cy + h / 2 - pad_h) / scale + y
-                    all_detections.append(
-                        {
-                            "box": [x1, y1, x2, y2],
-                            "score": float(max_score),
-                            "class_id": class_id,
-                        }
-                    )
+    t_tile_prep_end = time.perf_counter()
+
+    t_preprocess_start = time.perf_counter()
+
+    batch_input_tensors = []
+    batch_params = []
+
+    for item in tiles_with_coords:
+        input_tensor, scale, pad_w, pad_h = preprocess_tile(item["tile"], imgsz)
+        batch_input_tensors.append(input_tensor)
+        batch_params.append(
+            {
+                "scale": scale,
+                "pad_w": pad_w,
+                "pad_h": pad_h,
+                "x": item["x"],
+                "y": item["y"],
+            }
+        )
+    t_preprocess_end = time.perf_counter()
+
+    t_stack_start = time.perf_counter()
+    batch_tensor = np.vstack(batch_input_tensors)
+    t_stack_end = time.perf_counter()
+    # [N,3,640,640]
+    t_run_start = time.perf_counter()
+    outputs = session.run(output_names, {input_name: batch_tensor})  # ~60ms
+    t_run_end = time.perf_counter()
+
+    t_postprocess_start = time.perf_counter()
+    batch_dets = outputs[0].transpose(0, 2, 1)
+    all_detections = []
+
+    for i, dets_per_tite in enumerate(batch_dets):
+        params = batch_params[i]
+        scale, pad_w, pad_h, x_offset, y_offset = (
+            params["scale"],
+            params["pad_w"],
+            params["pad_h"],
+            params["x"],
+            params["y"],
+        )
+
+        for det in dets_per_tite:
+            cx, cy, w, h = det[:4]
+            max_score = np.max(det[4:])
+            if max_score > conf_threshold:
+                class_id = np.argmax(det[4:])
+                x1 = (cx - w / 2 - pad_w) / scale + x_offset
+                y1 = (cy - h / 2 - pad_h) / scale + y_offset
+                x2 = (cx + w / 2 - pad_w) / scale + x_offset
+                y2 = (cy + h / 2 - pad_h) / scale + y_offset
+                all_detections.append(
+                    {
+                        "box": [x1, y1, x2, y2],
+                        "score": float(max_score),
+                        "class_id": class_id,
+                    }
+                )
+
+    t_postprocess_end = time.perf_counter()
 
     if not all_detections:
         return []
 
     # --- NMS后处理 ---
+    t_nms_start = time.perf_counter()
     final_results = []
     # 按类别进行NMS
     unique_class_ids = set(d["class_id"] for d in all_detections)
@@ -123,6 +172,32 @@ def get_inference_results(
 
         for idx in keep_indices:
             final_results.append(class_detections[idx])
+    t_nms_end = time.perf_counter()
+
+    t_total_end = time.perf_counter()
+
+    if not hasattr(get_inference_results, "call_count"):
+        get_inference_results.call_count = 0
+
+    if get_inference_results.call_count % 10 == 0:
+        print("--- get_inference_results 详细耗时 ---")
+        print(
+            f"  - (a) 图块准备: {(t_tile_prep_end - t_tile_prep_start) * 1000:.2f} ms"
+        )
+        print(
+            f"  - (b) 批量预处理 (含resize): {(t_preprocess_end - t_preprocess_start) * 1000:.2f} ms"
+        )
+        print(f"  - (c) np.vstack: {(t_stack_end - t_stack_start) * 1000:.2f} ms")
+        print(
+            f"  - (d) session.run: {(t_run_end - t_run_start) * 1000:.2f} ms  <-- GPU部分"
+        )
+        print(
+            f"  - (e) 批量后处理 (坐标转换): {(t_postprocess_end - t_postprocess_start) * 1000:.2f} ms"
+        )
+        print(f"  - (f) NMS: {(t_nms_end - t_nms_start) * 1000:.2f} ms")
+        print(f"  -> 总计: {(t_total_end - t_total_start) * 1000:.2f} ms")
+
+    get_inference_results.call_count += 1
 
     return final_results
 
@@ -222,8 +297,10 @@ class Worker(QObject):
             self.model_path, providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
         )
         sct = mss.mss()
-
+        frame_count = 0
         while self._is_running:
+            t_start = time.perf_counter()
+
             if not win32gui.IsWindow(self.hwnd) or win32gui.IsIconic(self.hwnd):
                 self.window_inactive.emit()
                 time.sleep(0.5)
@@ -251,14 +328,19 @@ class Worker(QObject):
                 time.sleep(0.1)
                 continue
 
+            t_grab_start = time.perf_counter()
             img = np.array(sct.grab(monitor))
             if img.size == 0:
                 continue
+            t_grab_end = time.perf_counter()
+
             img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
+            t_inference_start = time.perf_counter()
             results = get_inference_results(
                 session, img_bgr, self.imgsz, self.conf, self.iou
             )
+            t_inference_end = time.perf_counter()
 
             geometry = (
                 screen_x_logical,
@@ -269,7 +351,17 @@ class Worker(QObject):
             )
             self.detections_ready.emit(results, geometry)
 
-            time.sleep(0.01)
+            # time.sleep(0.01)
+            t_end = time.perf_counter()
+            if frame_count % 10 == 0:
+                print(
+                    f"屏幕截图 (sct.grab): {(t_grab_end - t_grab_start) * 1000:.2f} ms"
+                )
+                print(
+                    f"完整推理函数 (get_inference_results): {(t_inference_end - t_inference_start) * 1000:.2f} ms"
+                )
+                print(f"总循环时间: {(t_end - t_start) * 1000:.2f} ms")
+            frame_count += 1
 
         sct.close()
         print("工作线程已停止。")
