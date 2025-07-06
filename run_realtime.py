@@ -19,6 +19,9 @@ from PyQt6.QtWidgets import QApplication, QWidget, QLabel
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont
 from PyQt6.QtCore import Qt, QRect, QThread, pyqtSignal, QObject
 
+import threading
+from multiprocessing.pool import ThreadPool
+
 
 def get_dpi_scale_factor(hwnd):
     """获取指定窗口的DPI缩放比例。"""
@@ -86,7 +89,7 @@ def get_inference_results(
         for x in x_steps:
             tile = image[y : min(y + tile_size, orig_h), x : min(x + tile_size, orig_w)]
             if tile.shape[0] > 0 and tile.shape[1] > 0:
-                tiles_with_coords.append({"tile": tile, "x": x, "y": y})
+                tiles_with_coords.append((tile, x, y, imgsz))
 
     if not tiles_with_coords:
         return []
@@ -95,15 +98,23 @@ def get_inference_results(
 
     t_preprocess_start = time.perf_counter()
 
-    num_tiles = len(tiles_with_coords)
+    def process_single_tile(tile, x, y, size):
+        input_tensor, scale, pad_w, pad_h = preprocess_tile(tile, size)
+        return input_tensor, scale, pad_w, pad_h, x, y
+
+    # 使用线程池的 starmap 并行处理所有图块
+    # starmap 可以接受一个元组列表作为参数，非常方便
+    results = thread_pool.starmap(process_single_tile, tiles_with_coords)
+
+    num_tiles = len(results)
 
     batch_tensor = np.empty((num_tiles, 3, imgsz, imgsz), dtype=np.float32)
     batch_params = []
 
     for i, item in enumerate(tiles_with_coords):
-        input_tensor, scale, pad_w, pad_h = preprocess_tile(item["tile"], imgsz)
+        input_tensor, scale, pad_w, pad_h = preprocess_tile(item[0], imgsz)
         batch_tensor[i] = input_tensor
-        batch_params.append((scale, pad_w, pad_h, item["x"], item["y"]))
+        batch_params.append((scale, pad_w, pad_h, item[1], item[2]))
 
     params_array = np.array(batch_params, dtype=np.float32)
     t_preprocess_end = time.perf_counter()
@@ -456,7 +467,17 @@ if __name__ == "__main__":
         print(f"[错误] 类别文件未找到: {CLASS_MAP_FILE}")
         sys.exit(1)
 
+    NUM_THREADS = os.cpu_count() or 4
+    thread_pool = ThreadPool(processes=NUM_THREADS)
+    print(f"已创建 {NUM_THREADS} 个线程的全局线程池。")
+
     # 启动实时检测
     run_realtime_detection(
         MODEL_PATH, MY_CLASS_NAMES, IMGSZ, CONF_THRESHOLD, IOU_THRESHOLD
     )
+
+    # 程序结束时关闭线程池
+    print("正在关闭线程池...")
+    thread_pool.close()
+    thread_pool.join()
+    print("线程池已关闭。")
