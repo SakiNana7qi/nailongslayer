@@ -95,83 +95,88 @@ def get_inference_results(
 
     t_preprocess_start = time.perf_counter()
 
-    batch_input_tensors = []
+    num_tiles = len(tiles_with_coords)
+
+    batch_tensor = np.empty((num_tiles, 3, imgsz, imgsz), dtype=np.float32)
     batch_params = []
 
-    for item in tiles_with_coords:
+    for i, item in enumerate(tiles_with_coords):
         input_tensor, scale, pad_w, pad_h = preprocess_tile(item["tile"], imgsz)
-        batch_input_tensors.append(input_tensor)
-        batch_params.append(
-            {
-                "scale": scale,
-                "pad_w": pad_w,
-                "pad_h": pad_h,
-                "x": item["x"],
-                "y": item["y"],
-            }
-        )
+        batch_tensor[i] = input_tensor
+        batch_params.append((scale, pad_w, pad_h, item["x"], item["y"]))
+
+    params_array = np.array(batch_params, dtype=np.float32)
     t_preprocess_end = time.perf_counter()
 
-    t_stack_start = time.perf_counter()
-    batch_tensor = np.vstack(batch_input_tensors)
-    t_stack_end = time.perf_counter()
     # [N,3,640,640]
     t_run_start = time.perf_counter()
     outputs = session.run(output_names, {input_name: batch_tensor})  # ~60ms
+    # [N,84,8400]
     t_run_end = time.perf_counter()
 
     t_postprocess_start = time.perf_counter()
     batch_dets = outputs[0].transpose(0, 2, 1)
-    all_detections = []
+    boxes = batch_dets[..., :4]
+    # [N,8400,4]
+    scores_all_classes = batch_dets[..., 4:]
+    # [N,8400,80]
+    scores = np.max(scores_all_classes, axis=-1)
+    class_ids = np.argmax(scores_all_classes, axis=-1)
+    # [N,8400,0]
 
-    for i, dets_per_tite in enumerate(batch_dets):
-        params = batch_params[i]
-        scale, pad_w, pad_h, x_offset, y_offset = (
-            params["scale"],
-            params["pad_w"],
-            params["pad_h"],
-            params["x"],
-            params["y"],
-        )
+    mask = scores > conf_threshold
 
-        for det in dets_per_tite:
-            cx, cy, w, h = det[:4]
-            max_score = np.max(det[4:])
-            if max_score > conf_threshold:
-                class_id = np.argmax(det[4:])
-                x1 = (cx - w / 2 - pad_w) / scale + x_offset
-                y1 = (cy - h / 2 - pad_h) / scale + y_offset
-                x2 = (cx + w / 2 - pad_w) / scale + x_offset
-                y2 = (cy + h / 2 - pad_h) / scale + y_offset
-                all_detections.append(
-                    {
-                        "box": [x1, y1, x2, y2],
-                        "score": float(max_score),
-                        "class_id": class_id,
-                    }
-                )
+    filtered_boxes = boxes[mask]
+    filtered_scores = scores[mask]
+    filtered_class_ids = class_ids[mask]
 
-    t_postprocess_end = time.perf_counter()
+    tile_indices = np.where(mask)[0]
 
-    if not all_detections:
+    if tile_indices.size == 0:
         return []
+
+    applied_params = params_array[tile_indices]
+
+    scale = applied_params[:, 0]
+    pad_w = applied_params[:, 1]
+    pad_h = applied_params[:, 2]
+    x_offset = applied_params[:, 3]
+    y_offset = applied_params[:, 4]
+
+    cx, cy, w, h = filtered_boxes.T
+    x1 = (cx - w / 2 - pad_w.squeeze()) / scale.squeeze() + x_offset.squeeze()
+    y1 = (cy - h / 2 - pad_h.squeeze()) / scale.squeeze() + y_offset.squeeze()
+    x2 = (cx + w / 2 - pad_w.squeeze()) / scale.squeeze() + x_offset.squeeze()
+    y2 = (cy + h / 2 - pad_h.squeeze()) / scale.squeeze() + y_offset.squeeze()
+
+    final_boxes = np.vstack((x1, y1, x2, y2)).T
+    t_postprocess_end = time.perf_counter()
 
     # --- NMS后处理 ---
     t_nms_start = time.perf_counter()
     final_results = []
     # 按类别进行NMS
-    unique_class_ids = set(d["class_id"] for d in all_detections)
+    unique_class_ids = np.unique(filtered_class_ids)
     for class_id in unique_class_ids:
-        class_detections = [d for d in all_detections if d["class_id"] == class_id]
-        boxes = torch.tensor([d["box"] for d in class_detections], dtype=torch.float32)
-        scores = torch.tensor(
-            [d["score"] for d in class_detections], dtype=torch.float32
-        )
+        class_mask = filtered_class_ids == class_id
+        boxes_for_nms = torch.from_numpy(final_boxes[class_mask]).float()
+        scores_for_nms = torch.from_numpy(filtered_scores[class_mask]).float()
 
-        keep_indices = nms(boxes, scores, iou_threshold)
+        keep_indices = nms(boxes_for_nms, scores_for_nms, iou_threshold)
 
-        for idx in keep_indices:
-            final_results.append(class_detections[idx])
+        keep_indices_np = keep_indices.cpu().numpy()
+
+        kept_boxes = boxes_for_nms[keep_indices_np].cpu().numpy()
+        kept_scores = scores_for_nms[keep_indices_np].cpu().numpy()
+
+        for i in range(len(kept_boxes)):
+            final_results.append(
+                {
+                    "box": kept_boxes[i].tolist(),
+                    "score": kept_scores[i],
+                    "class_id": class_id,
+                }
+            )
     t_nms_end = time.perf_counter()
 
     t_total_end = time.perf_counter()
@@ -185,9 +190,8 @@ def get_inference_results(
             f"  - (a) 图块准备: {(t_tile_prep_end - t_tile_prep_start) * 1000:.2f} ms"
         )
         print(
-            f"  - (b) 批量预处理 (含resize): {(t_preprocess_end - t_preprocess_start) * 1000:.2f} ms"
+            f"  - (b) 批量预处理: {(t_preprocess_end - t_preprocess_start) * 1000:.2f} ms"
         )
-        print(f"  - (c) np.vstack: {(t_stack_end - t_stack_start) * 1000:.2f} ms")
         print(
             f"  - (d) session.run: {(t_run_end - t_run_start) * 1000:.2f} ms  <-- GPU部分"
         )
